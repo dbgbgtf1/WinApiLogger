@@ -6,7 +6,8 @@ param(
     [string]$AnalysisPath = "",
     [string]$CertificatePath = "",
     [string]$ResultPath = "",
-    [string]$ExpectedFileVersion = "10.0.26100.9974"
+    [string]$ExpectedFileVersion = "10.0.26100.9974",
+    [string]$ServiceName = "WinApiLogger"
 )
 
 $ErrorActionPreference = 'Stop'
@@ -26,12 +27,13 @@ if (-not $ResultPath) {
     $ResultPath = Join-Path $Root 'WinApiLogger-smoke.json'
 }
 
-$serviceName = 'WinApiLogger'
+$serviceName = $ServiceName
 $result = [ordered]@{
     success = $false
     started_at = (Get-Date).ToString('o')
     finished_at = $null
     target_pid = $null
+    target_exit_code = $null
     stream_id = $null
     stream_state = $null
     stream_failure = $null
@@ -290,6 +292,10 @@ try {
     Set-Stage "wait-target-exit"
     if (-not $target.WaitForExit(30000)) {
         throw 'Target process did not exit within 30 seconds'
+    }
+    $result.target_exit_code = $target.ExitCode
+    if ($target.ExitCode -ne 0) {
+        throw "Target process exited unexpectedly with code $($target.ExitCode)"
     }
     Start-Sleep -Milliseconds 500
 

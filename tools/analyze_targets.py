@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 import capstone
+import capstone.x86 as x86
 import pefile
 
 
@@ -57,6 +58,35 @@ EXPECTED_MACHINE = 0x8664
 EXPECTED_MAGIC = 0x20B
 MAX_COPY_INSTRUCTION_BYTES = 15
 RELOCATION_PADDING = 16
+INT32_MIN = -(1 << 31)
+INT32_MAX = (1 << 31) - 1
+STUB_HEADER_SIZE = 16
+STUB_FIXED_SIZE = 40
+STUB_ORIGINAL_OFFSET = 27
+STUB_ALIGNMENT = 16
+STUB_SEARCH_START = 0x01000000
+STUB_SEARCH_STEP = 0x01000000
+STUB_SEARCH_LIMIT = 0x60000000
+RIP_DISP_NONE = 0xFF
+
+# Exact, hash-bound exceptions for cases reviewed as target-specific handling.
+# The value is the instruction mnemonic that must still be present.
+# This ntdll lea returns the other entry's address; preserving that address is
+# intentional, and executing it later enters the target entry's own stub.
+RIP_RELATIVE_OVERLAP_OVERRIDES: dict[tuple[str, int, int], str] = {
+    (
+        "A0F81BF5C610C0FF0A550ADC020A58446F214790C748057BB575042E972E6A34",
+        0x124800,
+        0x16AA40,
+    ): "lea",
+}
+
+# These exports are unsafe to detour even when their operand relocation is
+# mechanically possible. KiUserExceptionDispatcher must stay untouched because
+# any fault raised while logging is routed back through the patched dispatcher.
+EXPORT_SAFETY_EXCLUSIONS: dict[str, str] = {
+    "KiUserExceptionDispatcher": "exception-dispatcher-reentrancy-risk",
+}
 
 
 class AnalysisError(RuntimeError):
@@ -78,6 +108,10 @@ class ExportDecision:
     canonical_name: str
     patch_length: int
     original_bytes_hex: str
+    rip_disp_offset: int | None
+    rip_old_disp: int | None
+    rip_target_rva: int | None
+    rip_mnemonic: str | None
     installable: bool
     reason: str
 
@@ -94,6 +128,22 @@ class ModuleAnalysis:
     exports_seen: int
     installable: tuple[ExportDecision, ...]
     skipped: tuple[ExportDecision, ...]
+    rip_fixup_count: int
+    rip_target_min_rva: int | None
+    rip_target_max_rva: int | None
+    rip_disp_min: int | None
+    rip_disp_max: int | None
+
+
+@dataclasses.dataclass(frozen=True)
+class PatchDecode:
+    length: int
+    original: bytes
+    failure: str | None
+    rip_disp_offset: int | None = None
+    rip_old_disp: int | None = None
+    rip_target_rva: int | None = None
+    rip_mnemonic: str | None = None
 
 
 def sha256_file(path: Path) -> str:
@@ -276,24 +326,28 @@ def _decode_patch(
     section_end: int,
     relocations: Sequence[tuple[int, int]],
     decoder: capstone.Cs,
-) -> tuple[int, bytes, str | None]:
+) -> PatchDecode:
     if rva + 5 > section_end or rva + 5 > len(image):
-        return 0, b"", "entry-or-patch-out-of-bounds"
+        return PatchDecode(0, b"", "entry-or-patch-out-of-bounds")
     if _overlaps_any(rva, rva + 5, relocations):
-        return 0, b"", "entry-or-patch-has-relocation"
+        return PatchDecode(0, b"", "entry-or-patch-has-relocation")
 
     consumed = 0
     original = bytearray()
+    rip_disp_offset: int | None = None
+    rip_old_disp: int | None = None
+    rip_target_rva: int | None = None
+    rip_mnemonic: str | None = None
     decode_end = min(section_end, rva + MAX_COPY_INSTRUCTION_BYTES)
     for insn in decoder.disasm(image[rva:decode_end], rva):
         if insn.address != rva + len(original):
-            return 0, b"", "non-contiguous-instruction-decoding"
+            return PatchDecode(0, b"", "non-contiguous-instruction-decoding")
         if len(original) + insn.size > MAX_COPY_INSTRUCTION_BYTES:
-            return 0, b"", "first-instructions-too-long"
+            return PatchDecode(0, b"", "first-instructions-too-long")
         if _overlaps_any(insn.address, insn.address + insn.size, relocations):
-            return 0, b"", "first-instruction-has-relocation"
+            return PatchDecode(0, b"", "first-instruction-has-relocation")
         if insn.group(capstone.CS_GRP_RET):
-            return 0, b"", "first-instruction-is-ret"
+            return PatchDecode(0, b"", "first-instruction-is-ret")
         is_control_flow = insn.group(capstone.CS_GRP_JUMP) or insn.group(
             capstone.CS_GRP_CALL
         )
@@ -301,14 +355,61 @@ def _decode_patch(
             operand.type == capstone.CS_OP_IMM for operand in insn.operands
         )
         if is_relative_control_flow:
-            return 0, b"", "first-instruction-is-relative-control-flow"
-        if "rip" in insn.op_str.casefold():
-            return 0, b"", "first-instruction-uses-rip-relative-operand"
+            return PatchDecode(
+                0, b"", "first-instruction-is-relative-control-flow"
+            )
+        rip_operands = [
+            operand
+            for operand in insn.operands
+            if operand.type == capstone.CS_OP_MEM
+            and operand.mem.base == x86.X86_REG_RIP
+        ]
+        if len(rip_operands) > 1:
+            return PatchDecode(0, b"", "multiple-rip-relative-operands")
+        if rip_operands:
+            if rip_disp_offset is not None:
+                return PatchDecode(0, b"", "multiple-rip-relative-instructions")
+            encoding = insn.encoding
+            if encoding.disp_size != 4:
+                return PatchDecode(0, b"", "unsupported-rip-relative-encoding")
+            instruction_offset = len(original)
+            rip_disp_offset = instruction_offset + int(encoding.disp_offset)
+            if (
+                rip_disp_offset < 0
+                or int(encoding.disp_offset) + 4 > len(insn.bytes)
+            ):
+                return PatchDecode(0, b"", "invalid-rip-relative-encoding")
+            rip_old_disp = struct.unpack_from(
+                "<i", insn.bytes, encoding.disp_offset
+            )[0]
+            if rip_old_disp != int(rip_operands[0].mem.disp):
+                return PatchDecode(0, b"", "rip-relative-encoding-mismatch")
+            rip_target_rva = insn.address + insn.size + rip_old_disp
+            rip_mnemonic = insn.mnemonic
         original.extend(insn.bytes)
         consumed = len(original)
         if consumed >= 5:
-            return consumed, bytes(original), None
-    return 0, b"", "instruction-boundary-not-found"
+            return PatchDecode(
+                consumed,
+                bytes(original),
+                None,
+                rip_disp_offset,
+                rip_old_disp,
+                rip_target_rva,
+                rip_mnemonic,
+            )
+    return PatchDecode(0, b"", "instruction-boundary-not-found")
+
+
+def _safety_exclusion_reason(names: Sequence[str]) -> str | None:
+    return next(
+        (
+            EXPORT_SAFETY_EXCLUSIONS[name]
+            for name in names
+            if name in EXPORT_SAFETY_EXCLUSIONS
+        ),
+        None,
+    )
 
 
 def analyze_module(
@@ -367,14 +468,17 @@ def analyze_module(
                 if next_index < len(export_images)
                 else section_end
             )
-            patch_length, _original, failure = _decode_patch(
+            decoded = _decode_patch(
                 image,
                 rva,
                 section_end,
                 relocations,
                 decoder,
             )
-            if failure is None and rva + patch_length > next_rva:
+            if (
+                decoded.failure is None
+                and rva + decoded.length > next_rva
+            ):
                 overlapping_rvas.add(rva)
                 overlapping_rvas.add(next_rva)
 
@@ -388,9 +492,14 @@ def analyze_module(
                 if section is not None
                 else 0
             )
+            safety_reason = _safety_exclusion_reason(names)
             reason = ""
             patch_length = 0
             original = b""
+            rip_disp_offset = None
+            rip_old_disp = None
+            rip_target_rva = None
+            rip_mnemonic = None
 
             if forwarded_range <= rva < forwarded_end:
                 reason = "forwarded-export"
@@ -402,12 +511,21 @@ def analyze_module(
                 reason = "section-out-of-bounds"
             elif rva in overlapping_rvas:
                 reason = "overlapping-export-entry"
+            elif safety_reason is not None:
+                reason = safety_reason
             else:
-                patch_length, original, failure = _decode_patch(
+                decoded = _decode_patch(
                     image, rva, section_end, relocations, decoder
                 )
-                if failure:
-                    reason = failure
+                if decoded.failure:
+                    reason = decoded.failure
+                else:
+                    patch_length = decoded.length
+                    original = decoded.original
+                    rip_disp_offset = decoded.rip_disp_offset
+                    rip_old_disp = decoded.rip_old_disp
+                    rip_target_rva = decoded.rip_target_rva
+                    rip_mnemonic = decoded.rip_mnemonic
 
             installable = not reason
             decisions.append(
@@ -419,6 +537,10 @@ def analyze_module(
                     canonical_name=canonical,
                     patch_length=patch_length,
                     original_bytes_hex=original.hex().upper(),
+                    rip_disp_offset=rip_disp_offset,
+                    rip_old_disp=rip_old_disp,
+                    rip_target_rva=rip_target_rva,
+                    rip_mnemonic=rip_mnemonic,
                     installable=installable,
                     reason=reason or "ok",
                 )
@@ -426,6 +548,11 @@ def analyze_module(
 
         installable = tuple(item for item in decisions if item.installable)
         skipped = tuple(item for item in decisions if not item.installable)
+        rip_items = tuple(
+            item
+            for item in installable
+            if item.rip_disp_offset is not None
+        )
         return ModuleAnalysis(
             module_id=module_id,
             name=name,
@@ -437,6 +564,27 @@ def analyze_module(
             exports_seen=len(decisions),
             installable=installable,
             skipped=skipped,
+            rip_fixup_count=len(rip_items),
+            rip_target_min_rva=(
+                min(item.rip_target_rva for item in rip_items)
+                if rip_items
+                else None
+            ),
+            rip_target_max_rva=(
+                max(item.rip_target_rva for item in rip_items)
+                if rip_items
+                else None
+            ),
+            rip_disp_min=(
+                min(item.rip_old_disp for item in rip_items)
+                if rip_items
+                else None
+            ),
+            rip_disp_max=(
+                max(item.rip_old_disp for item in rip_items)
+                if rip_items
+                else None
+            ),
         )
     finally:
         pe.close()
@@ -466,7 +614,160 @@ def analyze_all(
                 path,
             )
         )
-    return tuple(analyses)
+    result = tuple(analyses)
+    _validate_rip_relative_layouts(result)
+    return result
+
+
+def _align_up(value: int, alignment: int) -> int:
+    return (value + alignment - 1) & ~(alignment - 1)
+
+
+def _module_stub_layout(
+    analysis: ModuleAnalysis,
+) -> tuple[dict[int, tuple[int, int]], int]:
+    offsets: dict[int, tuple[int, int]] = {}
+    module_bytes = 0
+    for item in analysis.installable:
+        stub_size = _align_up(
+            STUB_FIXED_SIZE + item.patch_length, STUB_ALIGNMENT
+        )
+        offsets[item.rva] = (STUB_HEADER_SIZE + module_bytes, stub_size)
+        module_bytes += stub_size
+    return offsets, STUB_HEADER_SIZE + module_bytes
+
+
+def _stub_candidate_offsets(module_size: int) -> tuple[int, ...]:
+    rounded_size = _align_up(module_size, 0x10000)
+    candidates: list[int] = []
+    for offset in range(
+        STUB_SEARCH_START, STUB_SEARCH_LIMIT + 1, STUB_SEARCH_STEP
+    ):
+        candidates.append(-(offset + rounded_size))
+        candidates.append(offset)
+    return tuple(candidates)
+
+
+def _encode_rel32(source: int, destination: int) -> int | None:
+    displacement = destination - (source + 5)
+    if INT32_MIN <= displacement <= INT32_MAX:
+        return displacement
+    return None
+
+
+def _module_stub_candidate_feasible(
+    analysis: ModuleAnalysis,
+    offsets: dict[int, tuple[int, int]],
+    stub_relative_offset: int,
+) -> bool:
+    for item in analysis.installable:
+        stub_offset, _stub_size = offsets[item.rva]
+        if (
+            _encode_rel32(item.rva, stub_relative_offset + stub_offset)
+            is None
+        ):
+            return False
+
+        continuation_source = (
+            stub_relative_offset
+            + stub_offset
+            + STUB_ORIGINAL_OFFSET
+            + item.patch_length
+        )
+        if (
+            _encode_rel32(
+                continuation_source, item.rva + item.patch_length
+            )
+            is None
+        ):
+            return False
+
+        if item.rip_disp_offset is not None:
+            assert item.rip_old_disp is not None
+            delta = (
+                stub_relative_offset
+                + stub_offset
+                + STUB_ORIGINAL_OFFSET
+                - item.rva
+            )
+            new_disp = item.rip_old_disp - delta
+            if not INT32_MIN <= new_disp <= INT32_MAX:
+                return False
+    return True
+
+
+def _validate_rip_relative_layouts(
+    analyses: Sequence[ModuleAnalysis],
+) -> None:
+    failures: list[str] = []
+    for analysis in analyses:
+        patch_ranges = [
+            (item.rva, item.rva + item.patch_length, item)
+            for item in analysis.installable
+        ]
+
+        module_failed = False
+        for item in analysis.installable:
+            if item.rip_target_rva is None:
+                continue
+            for start, end, destination in patch_ranges:
+                if start <= item.rip_target_rva < end:
+                    override = RIP_RELATIVE_OVERLAP_OVERRIDES.get(
+                        (analysis.sha256, item.rva, item.rip_target_rva)
+                    )
+                    if (
+                        override is not None
+                        and item.rip_mnemonic == override
+                    ):
+                        break
+                    failures.append(
+                        "RIP-relative target overlaps an overwritten patch "
+                        f"range: module={analysis.name} "
+                        f"sha256={analysis.sha256} rva=0x{item.rva:X} "
+                        f"symbol={item.canonical_name} "
+                        f"target_rva=0x{item.rip_target_rva:X} "
+                        f"patch=[0x{start:X},0x{end:X}) "
+                        f"patch_symbol={destination.canonical_name}"
+                    )
+                    module_failed = True
+                    break
+
+        if module_failed:
+            continue
+
+        offsets, module_size = _module_stub_layout(analysis)
+        candidates = _stub_candidate_offsets(module_size)
+        if not any(
+            _module_stub_candidate_feasible(analysis, offsets, candidate)
+            for candidate in candidates
+        ):
+            target_min = (
+                analysis.rip_target_min_rva
+                if analysis.rip_target_min_rva is not None
+                else 0
+            )
+            target_max = (
+                analysis.rip_target_max_rva
+                if analysis.rip_target_max_rva is not None
+                else 0
+            )
+            failures.append(
+                "No near-stub address can encode all rel32 references for "
+                f"module={analysis.name} sha256={analysis.sha256}; "
+                f"stub_size=0x{module_size:X} "
+                f"rip_target_rva=[0x{target_min:X},0x{target_max:X}] "
+                f"rip_disp=[{analysis.rip_disp_min},"
+                f"{analysis.rip_disp_max}] "
+                "search=[-0x"
+                f"{STUB_SEARCH_LIMIT + _align_up(module_size, 0x10000):X},"
+                f"+0x{STUB_SEARCH_LIMIT:X}]"
+            )
+
+    if failures:
+        raise AnalysisError(
+            "RIP-relative relocation requires target-specific handling:\n  "
+            + "\n  ".join(failures)
+        )
 
 
 def _c_string(value: str) -> str:
@@ -531,6 +832,10 @@ def _write_json(path: Path, analyses: Sequence[ModuleAnalysis]) -> None:
                         "aliases": item.aliases,
                         "patch_length": item.patch_length,
                         "original_bytes": item.original_bytes_hex,
+                        "rip_disp_offset": item.rip_disp_offset,
+                        "rip_old_disp": item.rip_old_disp,
+                        "rip_target_rva": item.rip_target_rva,
+                        "rip_mnemonic": item.rip_mnemonic,
                     }
                     for item in analysis.installable
                 ],
@@ -543,6 +848,11 @@ def _write_json(path: Path, analyses: Sequence[ModuleAnalysis]) -> None:
                     }
                     for item in analysis.skipped
                 ],
+                "rip_fixup_count": analysis.rip_fixup_count,
+                "rip_target_min_rva": analysis.rip_target_min_rva,
+                "rip_target_max_rva": analysis.rip_target_max_rva,
+                "rip_disp_min": analysis.rip_disp_min,
+                "rip_disp_max": analysis.rip_disp_max,
             }
         )
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -578,12 +888,21 @@ def _write_header(path: Path, analyses: Sequence[ModuleAnalysis]) -> None:
         "    uint32_t hook_rva;",
         "    uint32_t patch_length;",
         "    uint8_t original_bytes[15];",
+        "    uint8_t rip_disp_offset;",
+        "    int32_t rip_target_rva;",
         "    const char *canonical_name;",
         "    const char *aliases;",
         "} LOGGER_STATIC_EXPORT;",
         "#pragma pack(pop)",
         "",
         "#define LOGGER_MODULE_COUNT 3u",
+        f"#define LOGGER_STUB_HEADER_SIZE {STUB_HEADER_SIZE}u",
+        f"#define LOGGER_STUB_FIXED_SIZE {STUB_FIXED_SIZE}u",
+        f"#define LOGGER_STUB_ORIGINAL_OFFSET {STUB_ORIGINAL_OFFSET}u",
+        f"#define LOGGER_NEAR_STUB_START 0x{STUB_SEARCH_START:X}u",
+        f"#define LOGGER_NEAR_STUB_STEP 0x{STUB_SEARCH_STEP:X}u",
+        f"#define LOGGER_NEAR_STUB_LIMIT 0x{STUB_SEARCH_LIMIT:X}u",
+        f"#define LOGGER_RIP_DISP_NONE 0x{RIP_DISP_NONE:X}u",
         f"#define LOGGER_INSTALLABLE_EXPORT_COUNT {sum(len(a.installable) for a in analyses)}u",
         "",
         "static const LOGGER_STATIC_MODULE g_static_modules[LOGGER_MODULE_COUNT] = {",
@@ -613,10 +932,18 @@ def _write_header(path: Path, analyses: Sequence[ModuleAnalysis]) -> None:
             padded = list(byte_values) + [0] * (15 - len(byte_values))
             byte_text = ", ".join(f"0x{value:02X}" for value in padded)
             aliases = ";".join(item.aliases)
+            rip_disp_offset = (
+                RIP_DISP_NONE
+                if item.rip_disp_offset is None
+                else item.rip_disp_offset
+            )
+            rip_target_rva = item.rip_target_rva or 0
             lines.append(
                 "    {"
                 f"{item.module_id}u, 0x{item.rva:X}u, {item.patch_length}u, "
-                f"{{{byte_text}}}, {_c_string(item.canonical_name)}, "
+                f"{{{byte_text}}}, {rip_disp_offset}u, "
+                f"0x{rip_target_rva & 0xFFFFFFFF:X}u, "
+                f"{_c_string(item.canonical_name)}, "
                 f"{_c_string(aliases)}"
                 "},"
             )
@@ -701,6 +1028,42 @@ def _write_name_table(
     path.write_text("\r\n".join(lines), encoding="utf-8", newline="\n")
 
 
+def _write_rip_relative_report(
+    path: Path, analyses: Sequence[ModuleAnalysis]
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(
+            [
+                "module",
+                "rva",
+                "canonical_name",
+                "patch_length",
+                "disp_offset",
+                "old_disp",
+                "target_rva",
+                "mnemonic",
+            ]
+        )
+        for analysis in analyses:
+            for item in analysis.installable:
+                if item.rip_disp_offset is None:
+                    continue
+                writer.writerow(
+                    [
+                        analysis.name,
+                        f"0x{item.rva:X}",
+                        item.canonical_name,
+                        item.patch_length,
+                        item.rip_disp_offset,
+                        item.rip_old_disp,
+                        f"0x{item.rip_target_rva & 0xFFFFFFFF:X}",
+                        item.rip_mnemonic,
+                    ]
+                )
+
+
 def emit(
     target_dir: Path,
     build_dir: Path,
@@ -711,6 +1074,7 @@ def emit(
     build_dir.mkdir(parents=True, exist_ok=True)
     _write_csv(build_dir / "skipped_exports.csv", analyses)
     _write_json(build_dir / "analysis.json", analyses)
+    _write_rip_relative_report(build_dir / "rip_relative.csv", analyses)
     _write_header(driver_include_dir / "generated_metadata.h", analyses)
     _write_name_table(reader_include_dir / "generated_names.h", analyses)
     return analyses

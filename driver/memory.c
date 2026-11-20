@@ -2,10 +2,6 @@
 
 #include "state.h"
 
-#define LOGGER_NEAR_STUB_START 0x01000000u
-#define LOGGER_NEAR_STUB_STEP 0x01000000u
-#define LOGGER_NEAR_STUB_LIMIT 0x60000000u
-
 LOGGER_SHARED_IMAGE g_LoggerImage;
 
 static ULONG_PTR
@@ -267,7 +263,9 @@ LoggerTryAllocateAt (_In_ PEPROCESS Process, _In_ ULONG_PTR Address,
 
 NTSTATUS
 LoggerAllocateNearStub (_In_ PEPROCESS Process, _In_ PVOID ImageBase,
-                        _In_ SIZE_T Size, _Out_ PVOID *StubBase)
+                        _In_ SIZE_T Size,
+                        _In_opt_ LOGGER_NEAR_STUB_VALIDATOR Validator,
+                        _In_opt_ PVOID Context, _Out_ PVOID *StubBase)
 {
   ULONG_PTR base = (ULONG_PTR)ImageBase;
   ULONG_PTR rounded_size = (Size + 0xFFFFu) & ~0xFFFFULL;
@@ -290,13 +288,25 @@ LoggerAllocateNearStub (_In_ PEPROCESS Process, _In_ PVOID ImageBase,
           status
               = LoggerTryAllocateAt (Process, lower, rounded_size, StubBase);
           if (NT_SUCCESS (status))
-            return status;
+            {
+              if (Validator == NULL || Validator (*StubBase, Context))
+                return STATUS_SUCCESS;
+              LoggerFreeNearStub (Process, *StubBase, rounded_size);
+              *StubBase = NULL;
+              status = STATUS_INTEGER_OVERFLOW;
+            }
         }
 
       upper = LoggerAlignUpPointer (base + offset, 0x10000);
       status = LoggerTryAllocateAt (Process, upper, rounded_size, StubBase);
       if (NT_SUCCESS (status))
-        return status;
+        {
+          if (Validator == NULL || Validator (*StubBase, Context))
+            return STATUS_SUCCESS;
+          LoggerFreeNearStub (Process, *StubBase, rounded_size);
+          *StubBase = NULL;
+          status = STATUS_INTEGER_OVERFLOW;
+        }
     }
   return status;
 }
@@ -362,7 +372,8 @@ LoggerWriteTargetRange (_In_ PEPROCESS Process, _In_ PVOID Address,
                         _In_reads_bytes_opt_ (Size)
                             const VOID *ExpectedOriginal,
                         _In_reads_bytes_ (Size) const VOID *Replacement,
-                        _In_ SIZE_T Size, _Out_opt_ PUCHAR Original)
+                        _In_ SIZE_T Size, _Out_opt_ PUCHAR Original,
+                        _Out_opt_ PBOOLEAN BytesChanged)
 {
   KAPC_STATE apc_state;
   NTSTATUS status;
@@ -374,6 +385,8 @@ LoggerWriteTargetRange (_In_ PEPROCESS Process, _In_ PVOID Address,
   ULONG old_protection = 0;
   BOOLEAN protection_changed = FALSE;
 
+  if (BytesChanged != NULL)
+    *BytesChanged = FALSE;
   KeStackAttachProcess (Process, &apc_state);
   status = ZwProtectVirtualMemory (NtCurrentProcess (), &base, &region_size,
                                    PAGE_EXECUTE_READWRITE, &old_protection);
@@ -396,7 +409,11 @@ LoggerWriteTargetRange (_In_ PEPROCESS Process, _In_ PVOID Address,
                 status = STATUS_INVALID_IMAGE_HASH;
             }
           if (NT_SUCCESS (status))
-            RtlCopyMemory (Address, Replacement, Size);
+            {
+              if (BytesChanged != NULL)
+                *BytesChanged = TRUE;
+              RtlCopyMemory (Address, Replacement, Size);
+            }
         }
       __except (LOGGER_HANDLE_MEMORY_EXCEPTION (GetExceptionCode ()))
         {

@@ -74,6 +74,13 @@ class ArchitectureTests(unittest.TestCase):
         self.assertTrue((ROOT / "tests" / "vm_preflight.ps1").is_file())
         self.assertTrue((ROOT / "tests" / "vm_smoke.ps1").is_file())
 
+    def test_vm_smoke_rejects_target_crash(self) -> None:
+        text = (ROOT / "tests" / "vm_smoke.ps1").read_text(
+            encoding="utf-8-sig"
+        )
+        self.assertIn("target_exit_code", text)
+        self.assertIn("if ($target.ExitCode -ne 0)", text)
+
     def test_stub_context_slot_uses_process_user_va(self) -> None:
         text = (ROOT / "driver" / "image.c").read_text(encoding="utf-8-sig")
         self.assertIn("State->Data.UserVa + LOGGER_CONTEXT_OFFSET", text)
@@ -95,7 +102,45 @@ class ArchitectureTests(unittest.TestCase):
         self.assertIn("ProbeForWrite (Address", function)
         self.assertIn("RtlEqualMemory (Address", function)
         self.assertIn("RtlCopyMemory (Address", function)
+        self.assertIn("*BytesChanged = TRUE", function)
         self.assertNotIn("RtlCopyMemory (base", function)
+
+    def test_stub_layout_constants_are_generated(self) -> None:
+        metadata = (
+            ROOT / "driver" / "generated" / "generated_metadata.h"
+        ).read_text(encoding="utf-8-sig")
+        image = (ROOT / "driver" / "image.c").read_text(
+            encoding="utf-8-sig"
+        )
+        memory = (ROOT / "driver" / "memory.c").read_text(
+            encoding="utf-8-sig"
+        )
+        for name in (
+            "LOGGER_STUB_HEADER_SIZE",
+            "LOGGER_STUB_FIXED_SIZE",
+            "LOGGER_STUB_ORIGINAL_OFFSET",
+            "LOGGER_NEAR_STUB_START",
+            "LOGGER_NEAR_STUB_STEP",
+            "LOGGER_NEAR_STUB_LIMIT",
+            "LOGGER_RIP_DISP_NONE",
+        ):
+            self.assertIn(f"#define {name}", metadata)
+        self.assertNotIn("#define LOGGER_STUB_HEADER_SIZE", image)
+        self.assertNotIn("#define LOGGER_NEAR_STUB_START", memory)
+        self.assertIn("LOGGER_RIP_DISP_NONE", image)
+        self.assertIn("LoggerFailureRipRelocationFailed", image)
+
+    def test_rip_relative_failure_reason_is_shared(self) -> None:
+        protocol = (ROOT / "common" / "protocol.h").read_text(
+            encoding="utf-8-sig"
+        )
+        reader = (ROOT / "reader" / "reader.c").read_text(
+            encoding="utf-8-sig"
+        )
+        self.assertIn("LoggerFailureRipRelocationFailed = 19", protocol)
+        self.assertIn(
+            "case LoggerFailureRipRelocationFailed", reader
+        )
 
     def test_driver_uses_generated_module_names_and_paths(self) -> None:
         image = (ROOT / "driver" / "image.c").read_text(encoding="utf-8-sig")

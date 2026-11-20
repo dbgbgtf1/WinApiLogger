@@ -72,6 +72,9 @@ typedef struct _LOGGER_MODULE_SNAPSHOT
   ULONG Capacity;
 } LOGGER_MODULE_SNAPSHOT;
 
+typedef BOOLEAN (*LOGGER_NEAR_STUB_VALIDATOR) (_In_ PVOID Candidate,
+                                              _In_opt_ PVOID Context);
+
 extern LOGGER_SHARED_IMAGE g_LoggerImage;
 
 extern NTSTATUS ZwProtectVirtualMemory (_In_ HANDLE ProcessHandle,
@@ -95,7 +98,10 @@ VOID LoggerFreePrivateData (_Inout_ LOGGER_PROCESS_STATE *State);
 NTSTATUS LoggerInitializeLoggerView (_Inout_ LOGGER_PROCESS_STATE *State);
 VOID LoggerFreeLoggerView (_Inout_ LOGGER_PROCESS_STATE *State);
 NTSTATUS LoggerAllocateNearStub (_In_ PEPROCESS Process, _In_ PVOID ImageBase,
-                                 _In_ SIZE_T Size, _Out_ PVOID *StubBase);
+                                 _In_ SIZE_T Size,
+                                 _In_opt_ LOGGER_NEAR_STUB_VALIDATOR Validator,
+                                 _In_opt_ PVOID Context,
+                                 _Out_ PVOID *StubBase);
 VOID LoggerFreeNearStub (_In_ PEPROCESS Process, _In_ PVOID StubBase,
                          _In_ SIZE_T Size);
 NTSTATUS LoggerProtectUserCode (_In_ PEPROCESS Process, _In_ PVOID Address,
@@ -122,7 +128,8 @@ NTSTATUS LoggerWriteTargetRange (_In_ PEPROCESS Process, _In_ PVOID Address,
                                      const VOID *ExpectedOriginal,
                                  _In_reads_bytes_ (Size)
                                      const VOID *Replacement,
-                                 _In_ SIZE_T Size, _Out_opt_ PUCHAR Original);
+                                 _In_ SIZE_T Size, _Out_opt_ PUCHAR Original,
+                                 _Out_opt_ PBOOLEAN BytesChanged);
 
 NTSTATUS LoggerInitializeStubLayout (void);
 ULONG LoggerExportStubOffset (_In_ ULONG ExportIndex);

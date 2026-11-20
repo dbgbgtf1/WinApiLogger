@@ -7,6 +7,7 @@
 - `build/WinApiLoggerCli.exe`：静态链接的 stream 控制和读取客户端。
 - `build/skipped_exports.csv`：所有未安装导出及跳过原因。
 - `build/analysis.json`：完整构建元数据，包括从目标 DLL 文件名生成的规范系统路径。
+- `build/rip_relative.csv`：所有 RIP-relative fixup 及其原目标 RVA。
 
 ## 目录与产物
 
@@ -15,6 +16,7 @@
 - `build/WinApiLoggerCli.exe`：静态链接的管理和读取客户端。
 - `build/analysis.json`：目标 DLL 身份和导出分析结果。
 - `build/skipped_exports.csv`：未安装导出及跳过原因。
+- `build/rip_relative.csv`：RIP-relative displacement 修正清单。
 - `build/vm/WinApiLoggerTest.cer`：一次性测试签名生成的公钥证书。
 
 ## 1. 构建机前置条件
@@ -74,6 +76,7 @@ build\WinApiLogger.sys
 build\WinApiLoggerCli.exe
 build\analysis.json
 build\skipped_exports.csv
+build\rip_relative.csv
 build\logger_payload.bin
 ```
 
@@ -286,8 +289,24 @@ C:\WinApiLogger\WinApiLogger-smoke.json
 ## 安全模型
 
 构建会拒绝 DLL 身份不匹配、转发导出或数据导出、首段指令包含 relocation、相对控制流、
-RIP-relative 操作数、ret、重叠导出以及越界范围的函数。每个入口在 patch 前都会核对
-构建期保存的完整原始字节；失败时回滚该模块已安装的入口，并把原因写入 stream 状态。
+ret、重叠导出以及越界范围的函数。首段中的 RIP-relative 操作数会记录其 `disp32` 偏移，
+运行时按 stub 地址重新计算 displacement。每个入口在 patch 前都会核对构建期保存的完整
+原始字节；任一 fixup、近地址可达性或入口写入失败都会放弃并回滚该模块，并把原因写入
+stream 状态。
+
+构建期还会检查每个 RIP-relative 目标是否落入同一模块中任意计划覆盖的入口区间，并验证所有近地址
+候选是否能同时满足模块内全部 RIP fixup 和两段 `E9 rel32`。任一检查失败都会终止构建，
+错误信息包含目标 DLL SHA-256、函数 RVA、目标 RVA 和搜索范围。替换 `target_dlls/` 后
+不得用 `-SkipAnalyze` 绕过该错误；必须按新的 DLL 哈希、导出布局和 stub 地址策略完成
+审查，并在 `tools/analyze_targets.py` 中增加精确到哈希的 target-specific 处理。
+当前已审查的特例只有 ntdll SHA-256
+`A0F81BF5C610C0FF0A550ADC020A58446F214790C748057BB575042E972E6A34` 中的
+`0x124800`：其 `lea` 返回 `0x16AA40` 函数入口地址。特例要求 RVA、目标 RVA 和
+指令助记符全部匹配，DLL 更新后不会自动沿用。
+
+导出名 `KiUserExceptionDispatcher` 无论位于哪个目标 DLL、哪个 RVA，也无论其指令是否可由
+RIP fixup 修正，都禁止安装。该入口用于把用户态异常送回分发器；如果日志路径自身触发异常，
+hook 会递归进入异常分发器并最终耗尽线程栈。
 
 每个目标进程使用一块私有 RW MDL，固定包含 64 字节 Context、64 字节队列头和 8,190
 个 32 字节 Logger 记录槽。`READ_STREAM` 每次有记录可读时临时遍历目标 PEB，把 caller

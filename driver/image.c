@@ -4,14 +4,28 @@
 #include "state.h"
 #include "../common/module_name.h"
 
-#define LOGGER_STUB_HEADER_SIZE 16u
-#define LOGGER_STUB_FIXED_SIZE 40u
-
 static ULONG g_ExportStubOffset[LOGGER_INSTALLABLE_EXPORT_COUNT];
 static ULONG g_ExportStubSize[LOGGER_INSTALLABLE_EXPORT_COUNT];
 static ULONG g_ExportOrdinalInModule[LOGGER_INSTALLABLE_EXPORT_COUNT];
 static ULONG g_ModuleExportCount[LOGGER_MODULE_COUNT];
 static ULONG g_ModuleStubSize[LOGGER_MODULE_COUNT];
+
+typedef struct _LOGGER_STUB_BUILD_FAILURE
+{
+  ULONG Reason;
+  ULONG HookRva;
+  UINT64 Source;
+  UINT64 Destination;
+  BOOLEAN Present;
+} LOGGER_STUB_BUILD_FAILURE;
+
+typedef struct _LOGGER_STUB_CANDIDATE_CONTEXT
+{
+  LOGGER_PROCESS_STATE *State;
+  ULONG ModuleId;
+  PUCHAR StubImage;
+  LOGGER_STUB_BUILD_FAILURE Failure;
+} LOGGER_STUB_CANDIDATE_CONTEXT;
 
 typedef struct _LOGGER_PARTIAL_PEB
 {
@@ -221,6 +235,8 @@ LoggerInitializeStubLayout (void)
       if (module >= LOGGER_MODULE_COUNT
           || item->patch_length < LOGGER_ENTRY_PATCH_BYTES
           || item->patch_length > 15u
+          || (item->rip_disp_offset != LOGGER_RIP_DISP_NONE
+              && item->rip_disp_offset + sizeof (LONG) > item->patch_length)
           || item->hook_rva >= g_static_modules[module].size_of_image)
         return STATUS_INVALID_IMAGE_FORMAT;
       module_index = g_ModuleExportCount[module];
@@ -448,7 +464,7 @@ LoggerRollbackModule (_Inout_ LOGGER_PROCESS_STATE *State, _In_ ULONG ModuleId,
       target = (PUCHAR)(ULONG_PTR)module->ImageBase + item->hook_rva;
       current = LoggerWriteTargetRange (State->Process, target, NULL,
                                         item->original_bytes,
-                                        item->patch_length, NULL);
+                                        item->patch_length, NULL, NULL);
       if (!NT_SUCCESS (current))
         {
           status = STATUS_UNSUCCESSFUL;
@@ -479,13 +495,17 @@ static BOOLEAN
 LoggerBuildModuleStubs (_Inout_ LOGGER_PROCESS_STATE *State,
                         _In_ ULONG ModuleId,
                         _Out_writes_bytes_ (State->Modules[ModuleId].StubSize)
-                            PUCHAR StubBase)
+                            PUCHAR StubImage,
+                        _In_ PVOID CandidateBase,
+                        _Out_ LOGGER_STUB_BUILD_FAILURE *Failure)
 {
   LOGGER_MODULE_STATE *module = &State->Modules[ModuleId];
-  PUCHAR stub_base = StubBase;
+  PUCHAR stub_base = StubImage;
   ULONG_PTR logger_entry
       = (ULONG_PTR)State->LoggerVa + LOGGER_PAYLOAD_ENTRY_RVA;
   ULONG index;
+
+  RtlZeroMemory (Failure, sizeof (*Failure));
 
   // Common slots at the start of each module stub region.
   // qword ContextSlot
@@ -509,7 +529,9 @@ LoggerBuildModuleStubs (_Inout_ LOGGER_PROCESS_STATE *State,
         continue;
       offset = g_ExportStubOffset[index];
       size = g_ExportStubSize[index];
-      module_id_rva_in_stub = 32u + (ULONG)item->patch_length;
+      module_id_rva_in_stub
+          = LOGGER_STUB_ORIGINAL_OFFSET + LOGGER_ENTRY_PATCH_BYTES
+            + (ULONG)item->patch_length;
       module_id_rva_offset = offset + module_id_rva_in_stub;
       stub = stub_base + offset;
 
@@ -546,28 +568,85 @@ LoggerBuildModuleStubs (_Inout_ LOGGER_PROCESS_STATE *State,
       stub[26] = 0x10;
 
       // <patch_length bytes>             ; copy complete original prologue
-      RtlCopyMemory (stub + 27, item->original_bytes, item->patch_length);
+      RtlCopyMemory (stub + LOGGER_STUB_ORIGINAL_OFFSET, item->original_bytes,
+                     item->patch_length);
+
+      if (item->rip_disp_offset != LOGGER_RIP_DISP_NONE)
+        {
+          LONG old_displacement;
+          LONG new_displacement;
+          INT64 delta;
+          INT64 adjusted;
+          PUCHAR copied_instruction
+              = stub + LOGGER_STUB_ORIGINAL_OFFSET;
+          PUCHAR final_instruction
+              = (PUCHAR)CandidateBase + offset + LOGGER_STUB_ORIGINAL_OFFSET;
+          PUCHAR original_entry
+              = (PUCHAR)(ULONG_PTR)module->ImageBase + item->hook_rva;
+
+          if ((ULONG)item->rip_disp_offset + sizeof (old_displacement)
+              > item->patch_length)
+            {
+              Failure->Reason = LoggerFailureRipRelocationFailed;
+              Failure->HookRva = item->hook_rva;
+              Failure->Source = (UINT64)(ULONG_PTR)final_instruction;
+              Failure->Destination
+                  = (UINT64)(ULONG_PTR)original_entry
+                    + (UINT64)(LONG64)item->rip_target_rva;
+              Failure->Present = TRUE;
+              return FALSE;
+            }
+
+          RtlCopyMemory (&old_displacement,
+                         copied_instruction + item->rip_disp_offset,
+                         sizeof (old_displacement));
+          delta = (INT64)(ULONG_PTR)final_instruction
+                  - (INT64)(ULONG_PTR)original_entry;
+          adjusted = (INT64)old_displacement - delta;
+          if (adjusted < -(INT64)MAXLONG - 1 || adjusted > (INT64)MAXLONG)
+            {
+              Failure->Reason = LoggerFailureRipRelocationFailed;
+              Failure->HookRva = item->hook_rva;
+              Failure->Source
+                  = (UINT64)(ULONG_PTR)(final_instruction
+                                        + item->rip_disp_offset);
+              Failure->Destination
+                  = (UINT64)(ULONG_PTR)original_entry
+                    + (UINT64)(LONG64)item->rip_target_rva;
+              Failure->Present = TRUE;
+              return FALSE;
+            }
+          new_displacement = (LONG)adjusted;
+          RtlCopyMemory (copied_instruction + item->rip_disp_offset,
+                         &new_displacement, sizeof (new_displacement));
+        }
 
       // E9 <continuation rel32>          ; jump to original + patch_length
-      stub[27 + item->patch_length] = 0xE9;
+      stub[LOGGER_STUB_ORIGINAL_OFFSET + item->patch_length] = 0xE9;
       {
         PVOID continuation = (PUCHAR)(ULONG_PTR)module->ImageBase
                              + item->hook_rva + item->patch_length;
-        PUCHAR final_stub = (PUCHAR)module->StubBase + offset;
-        if (!LoggerCanEncodeRel32 (final_stub + 27 + item->patch_length,
-                                   continuation, &displacement))
+        PUCHAR final_stub = (PUCHAR)CandidateBase + offset;
+        if (!LoggerCanEncodeRel32 (
+                final_stub + LOGGER_STUB_ORIGINAL_OFFSET + item->patch_length,
+                continuation, &displacement))
           {
-            State->FailureStatus = item->hook_rva;
-            State->FailureSource
-                = (UINT64)(ULONG_PTR)(final_stub + 27
+            Failure->Reason = LoggerFailureInvalidModuleIdRva;
+            Failure->HookRva = item->hook_rva;
+            Failure->Source
+                = (UINT64)(ULONG_PTR)(final_stub
+                                      + LOGGER_STUB_ORIGINAL_OFFSET
                                       + item->patch_length);
-            State->FailureDestination = (UINT64)(ULONG_PTR)continuation;
+            Failure->Destination = (UINT64)(ULONG_PTR)continuation;
+            Failure->Present = TRUE;
             return FALSE;
           }
       }
 
       // <qword ModuleIdRva>              ; ModuleId << 32 | HookRva
-      RtlCopyMemory (stub + 28 + item->patch_length, &displacement,
+      RtlCopyMemory (stub + LOGGER_STUB_ORIGINAL_OFFSET + 1
+                         + item->patch_length,
+                     &displacement,
                      sizeof (displacement));
       *((ULONG64 *)(stub + module_id_rva_in_stub))
           = ((ULONG64)ModuleId << 32) | item->hook_rva;
@@ -577,6 +656,17 @@ LoggerBuildModuleStubs (_Inout_ LOGGER_PROCESS_STATE *State,
                      size - module_id_rva_in_stub - sizeof (ULONG64), 0xCC);
     }
   return TRUE;
+}
+
+static BOOLEAN
+LoggerBuildStubCandidate (_In_ PVOID CandidateBase, _In_ PVOID Context)
+{
+  LOGGER_STUB_CANDIDATE_CONTEXT *context
+      = (LOGGER_STUB_CANDIDATE_CONTEXT *)Context;
+
+  return LoggerBuildModuleStubs (context->State, context->ModuleId,
+                                 context->StubImage, CandidateBase,
+                                 &context->Failure);
 }
 
 static NTSTATUS
@@ -595,6 +685,7 @@ LoggerPatchModule (_Inout_ LOGGER_PROCESS_STATE *State, _In_ ULONG ModuleId)
       PVOID stub;
       LONG displacement;
       NTSTATUS status;
+      BOOLEAN changed;
 
       if (item->module_id != ModuleId || module->ExportInstalled[ordinal])
         continue;
@@ -609,11 +700,14 @@ LoggerPatchModule (_Inout_ LOGGER_PROCESS_STATE *State, _In_ ULONG ModuleId)
       RtlFillMemory (patch + LOGGER_ENTRY_PATCH_BYTES,
                      item->patch_length - LOGGER_ENTRY_PATCH_BYTES, 0x90);
       RtlZeroMemory (actual, sizeof (actual));
+      changed = FALSE;
       status = LoggerWriteTargetRange (State->Process, target,
                                        item->original_bytes, patch,
-                                       item->patch_length, actual);
+                                       item->patch_length, actual, &changed);
       if (!NT_SUCCESS (status))
         {
+          if (changed)
+            module->ExportInstalled[ordinal] = 1;
           if (status == STATUS_INVALID_IMAGE_HASH)
             {
               State->FailureStatus = item->hook_rva;
@@ -638,6 +732,7 @@ LoggerInstallModule (_Inout_ LOGGER_PROCESS_STATE *State, _In_ ULONG ModuleId,
   NTSTATUS status;
   ULONG installed_count = 0;
   ULONG index;
+  LOGGER_STUB_CANDIDATE_CONTEXT candidate_context;
 
   if (ImageSize != 0 && ImageSize != g_static_modules[ModuleId].size_of_image)
     {
@@ -678,24 +773,31 @@ LoggerInstallModule (_Inout_ LOGGER_PROCESS_STATE *State, _In_ ULONG ModuleId,
       LoggerRecordModuleFailure (State, ModuleId, LoggerFailureOutOfMemory);
       return STATUS_INSUFFICIENT_RESOURCES;
     }
+  RtlZeroMemory (&candidate_context, sizeof (candidate_context));
+  candidate_context.State = State;
+  candidate_context.ModuleId = ModuleId;
+  candidate_context.StubImage = stub_image;
   status = LoggerAllocateNearStub (State->Process, ImageBase, module->StubSize,
-                                   &module->StubBase);
+                                   LoggerBuildStubCandidate,
+                                   &candidate_context, &module->StubBase);
   if (!NT_SUCCESS (status))
     {
       ExFreePoolWithTag (stub_image, LOGGER_MAPPING_TAG);
       module->StubBase = NULL;
-      LoggerRecordModuleFailure (State, ModuleId,
-                                 LoggerFailureStubAllocationFailed);
+      if (candidate_context.Failure.Present)
+        {
+          State->FailureStatus = candidate_context.Failure.HookRva;
+          State->FailureSource = candidate_context.Failure.Source;
+          State->FailureDestination = candidate_context.Failure.Destination;
+          LoggerRecordModuleFailure (State, ModuleId,
+                                     candidate_context.Failure.Reason);
+        }
+      else
+        {
+          LoggerRecordModuleFailure (State, ModuleId,
+                                     LoggerFailureStubAllocationFailed);
+        }
       return status;
-    }
-  if (!LoggerBuildModuleStubs (State, ModuleId, stub_image))
-    {
-      ExFreePoolWithTag (stub_image, LOGGER_MAPPING_TAG);
-      LoggerFreeNearStub (State->Process, module->StubBase, module->StubSize);
-      module->StubBase = NULL;
-      LoggerRecordModuleFailure (State, ModuleId,
-                                 LoggerFailureInvalidModuleIdRva);
-      return STATUS_INTEGER_OVERFLOW;
     }
   status = LoggerWriteUserRange (State->Process, module->StubBase, stub_image,
                                  module->StubSize);

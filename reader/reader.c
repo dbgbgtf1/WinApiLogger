@@ -164,6 +164,8 @@ ReaderFailureText (ULONG Reason)
       return "logger image mapping failed";
     case LoggerFailureQueueInitializationFailed:
       return "queue initialization failed";
+    case LoggerFailureRipRelocationFailed:
+      return "rip-relative relocation failed";
     default:
       return "invalid state";
     }

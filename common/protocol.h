@@ -149,7 +149,8 @@ typedef enum _LOGGER_FAILURE_REASON
   LoggerFailureInvalidModuleIdRva = 15,
   LoggerFailurePrivateMappingFailed = 16,
   LoggerFailureLoggerMappingFailed = 17,
-  LoggerFailureQueueInitializationFailed = 18
+  LoggerFailureQueueInitializationFailed = 18,
+  LoggerFailureRipRelocationFailed = 19
 } LOGGER_FAILURE_REASON;
 
 typedef struct _LOGGER_STREAM_INFO
