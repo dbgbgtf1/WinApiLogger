@@ -197,13 +197,19 @@ C:\WinApiLogger\WinApiLoggerCli.exe list
 C:\WinApiLogger\WinApiLoggerCli.exe read --stream 1 --follow
 ```
 
-实时观察所有活动流，并按模块或 API 过滤：
+实时观察所有活动流。`--module` 过滤输出中的 Hook 模块
+`called <hook-module>!<api>`；`--caller` 过滤冒号前的调用者模块：
 
 ```powershell
 C:\WinApiLogger\WinApiLoggerCli.exe watch --follow
 C:\WinApiLogger\WinApiLoggerCli.exe watch --follow --module KernelBase --api CreateFileW
+C:\WinApiLogger\WinApiLoggerCli.exe watch --follow --caller Notepad
+C:\WinApiLogger\WinApiLoggerCli.exe watch --follow --module KernelBase --caller Notepad
 C:\WinApiLogger\WinApiLoggerCli.exe watch --follow --pid 1234
 ```
+
+`--module` 和 `--caller` 均不区分大小写，扩展名可省略。两个条件同时指定时使用 AND
+关系。caller 名称最多保留 15 个 WCHAR，因此名称过长的模块可按 15 WCHAR 的截断名匹配。
 
 清空 filter：
 

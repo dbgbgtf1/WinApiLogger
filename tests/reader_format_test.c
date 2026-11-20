@@ -27,6 +27,8 @@ main (void)
   WCHAR expected[512];
   WCHAR stem[WIN_API_LOGGER_MODULE_NAME_CHARS];
   const WCHAR *long_name = L"VeryLongModuleName.dll";
+  WCHAR *caller_arguments[] = { L"--caller", L"Notepad" };
+  READER_OPTIONS parsed_options;
   int failures = 0;
 
   ZeroMemory (&options, sizeof (options));
@@ -61,10 +63,66 @@ main (void)
       ++failures;
     }
 
+  options.HasCaller = TRUE;
+  options.Caller = L"iphlpapi";
+  if (ReaderMatchesFilters (&options, &record, name))
+    {
+      fwprintf (stderr, L"combined module/caller filter was not AND\n");
+      ++failures;
+    }
+
+  options.Module = L"ntdll.dll";
+  if (!ReaderMatchesFilters (&options, &record, name))
+    {
+      fwprintf (stderr, L"caller filter did not accept iphlpapi\n");
+      ++failures;
+    }
+  options.Caller = L"IPHLPAPI.DLL";
+  if (!ReaderMatchesFilters (&options, &record, name))
+    {
+      fwprintf (stderr,
+                L"caller filter did not accept IPHLPAPI.DLL\n");
+      ++failures;
+    }
+  options.Caller = L"notepad";
+  if (ReaderMatchesFilters (&options, &record, name))
+    {
+      fwprintf (stderr, L"caller filter accepted notepad\n");
+      ++failures;
+    }
+
+  record.CallerModuleChars = WIN_API_LOGGER_MODULE_NAME_CHARS - 1;
+  wcscpy_s (record.CallerModule, _countof (record.CallerModule),
+            L"VeryLongModuleN");
+  options.Caller = L"VeryLongModuleName.exe";
+  if (!ReaderMatchesFilters (&options, &record, name))
+    {
+      fwprintf (stderr, L"caller filter did not handle truncation\n");
+      ++failures;
+    }
+
+  if (!ReaderParseOptions ((int)_countof (caller_arguments), caller_arguments,
+                           0, &parsed_options)
+      || !parsed_options.HasCaller
+      || wcscmp (parsed_options.Caller, L"Notepad") != 0)
+    {
+      fwprintf (stderr, L"caller argument parsing failed\n");
+      ++failures;
+    }
+
   ZeroMemory (&options, sizeof (options));
   record.CallerAddress = 0x7FF6ABCD1234ULL;
   record.CallerRva = 0;
   record.CallerModuleChars = 0;
+  options.HasCaller = TRUE;
+  options.Caller = L"Notepad";
+  if (ReaderMatchesFilters (&options, &record, name))
+    {
+      fwprintf (stderr, L"caller filter accepted an unknown caller\n");
+      ++failures;
+    }
+
+  ZeroMemory (&options, sizeof (options));
   swprintf_s (expected, _countof (expected),
               L"123.456 unknown-0x7FF6ABCD1234 called ntdll!%hs",
               name->canonical_name);

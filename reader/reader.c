@@ -6,6 +6,7 @@
 #include <windows.h>
 
 #include "../common/protocol.h"
+#include "../common/module_name.h"
 #include "generated/generated_names.h"
 
 #define READER_LIST_BUFFER_SIZE (256u * 1024u)
@@ -21,6 +22,8 @@ typedef struct _READER_OPTIONS
   ULONG Pid;
   BOOLEAN HasModule;
   const WCHAR *Module;
+  BOOLEAN HasCaller;
+  const WCHAR *Caller;
   BOOLEAN HasApi;
   const WCHAR *Api;
   BOOLEAN HasRva;
@@ -285,6 +288,28 @@ ReaderModuleMatches (const WCHAR *Expected, const char *Actual)
 }
 
 static BOOL
+ReaderCallerMatches (const WCHAR *Expected,
+                     const LOGGER_DRIVER_RECORD *Record)
+{
+  WCHAR actual[WIN_API_LOGGER_MODULE_NAME_CHARS];
+  WCHAR expected_stem[WIN_API_LOGGER_MODULE_NAME_CHARS];
+  ULONG actual_chars = Record->CallerModuleChars;
+  ULONG expected_chars;
+
+  if (actual_chars == 0 || Expected == NULL || *Expected == L'\0')
+    return FALSE;
+  if (actual_chars >= _countof (actual))
+    actual_chars = _countof (actual) - 1;
+  memcpy (actual, Record->CallerModule, actual_chars * sizeof (WCHAR));
+  actual[actual_chars] = L'\0';
+
+  expected_chars
+      = LoggerFormatModuleStem (Expected, (ULONG)wcslen (Expected),
+                                expected_stem);
+  return expected_chars != 0 && _wcsicmp (expected_stem, actual) == 0;
+}
+
+static BOOL
 ReaderMatchesFilters (const READER_OPTIONS *Options,
                       const LOGGER_DRIVER_RECORD *Record,
                       const LOGGER_NAME_ENTRY *Name)
@@ -303,6 +328,8 @@ ReaderMatchesFilters (const READER_OPTIONS *Options,
       if (!ReaderModuleMatches (Options->Module, module_name))
         return FALSE;
     }
+  if (Options->HasCaller && !ReaderCallerMatches (Options->Caller, Record))
+    return FALSE;
   if (Options->HasApi)
     {
       CHAR utf8_or_ansi[512];
@@ -604,7 +631,12 @@ ReaderUsage (const WCHAR *Program)
            L"  %ls read --stream <id> [--follow] [filters]\n"
            L"  %ls watch [--follow] [filters]\n"
            L"\n"
-           L"Filters: --pid <pid> --module <name> --api <name> --rva <hex>\n",
+           L"Filters:\n"
+           L"  --pid <pid>\n"
+           L"  --module <hook-module>\n"
+           L"  --caller <caller-module>\n"
+           L"  --api <name>\n"
+           L"  --rva <hex>\n",
            Program, Program, Program, Program, Program);
 }
 
@@ -659,6 +691,15 @@ ReaderParseOptions (int ArgumentCount, WCHAR **Arguments, int Start,
             }
           Options->HasModule = TRUE;
           Options->Module = Arguments[index];
+        }
+      else if (_wcsicmp (argument, L"--caller") == 0)
+        {
+          if (++index >= ArgumentCount)
+            {
+              return FALSE;
+            }
+          Options->HasCaller = TRUE;
+          Options->Caller = Arguments[index];
         }
       else if (_wcsicmp (argument, L"--api") == 0)
         {
