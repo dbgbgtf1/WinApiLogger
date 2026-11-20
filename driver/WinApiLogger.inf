@@ -1,0 +1,41 @@
+;
+; WinApiLogger control driver
+;
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4D36E97D-E325-11CE-BFC1-08002BE10318}
+Provider=%Provider%
+CatalogFile=WinApiLogger.cat
+DriverVer=11/19/2026,1.1.0.0
+PnpLockdown=1
+
+[DestinationDirs]
+DefaultDestDir=13
+
+[SourceDisksFiles]
+WinApiLogger.sys=1
+
+[SourceDisksNames]
+1=%DiskName%,,,
+
+[DefaultInstall.NTAMD64]
+CopyFiles=DriverCopyFiles
+
+[DriverCopyFiles]
+WinApiLogger.sys,,,0x100
+
+[DefaultInstall.NTAMD64.Services]
+AddService=WinApiLogger,0x00000002,WinApiLoggerService
+
+[WinApiLoggerService]
+DisplayName=%ServiceName%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%13%\WinApiLogger.sys
+
+[Strings]
+Provider="WinApiLogger"
+DiskName="WinApiLogger Driver"
+ServiceName="WinApiLogger"

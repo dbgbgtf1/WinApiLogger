@@ -1,3 +1,8 @@
+build/
+__pycache__/
+compile_commands.json
+target_dlls/
+
 # Prerequisites
 *.d
 
